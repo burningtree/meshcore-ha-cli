@@ -5,21 +5,17 @@ Command-line tool for controlling and querying MeshCore nodes via the Home Assis
 ## Install
 
 ```bash
-make install        # builds with bun and copies to ~/.bun/bin/mc
-cp .env.example .env
-# edit .env with your HA URL and token
+make install        # builds with Bun and copies to ~/.bun/bin/mc
+cp .env.example ~/.meshcore-ha-cli
+# edit ~/.meshcore-ha-cli with your HA URL and token
 ```
 
-`.env` is loaded from the same directory as the binary. To make it work from anywhere:
-
-```bash
-ln -s $(pwd)/.env ~/.bun/bin/.env
-```
+Configuration is loaded from environment variables, `.env` next to the binary/script, or `~/.meshcore-ha-cli`.
 
 ## Configuration
 
 ```ini
-# .env
+# ~/.meshcore-ha-cli
 HA_URL=https://homeassistant.local:8123
 HA_TOKEN=your-long-lived-access-token
 HA_VERIFY_TLS=false   # set false for self-signed certs / Tailscale
@@ -76,6 +72,36 @@ mc send <pubkey_prefix> <message>
 mc send 0a53ef "hello from cli"
 ```
 
+### `chat` — interactive direct chat
+
+Opens a live prompt for a contact. Type a message and press Enter to send; use `/quit` or Ctrl+C to exit.
+
+```bash
+mc chat <pubkey_prefix>
+
+mc chat 0a53ef
+```
+
+### `route` — show or set a contact route
+
+```bash
+mc route <pubkey_prefix>
+mc route <pubkey_prefix> direct
+mc route <pubkey_prefix> 1a,2c
+mc route <pubkey_prefix> auto
+```
+
+`direct` forces direct delivery with no repeater path. `auto`, `reset`, and `flood` clear the stored path so MeshCore can rediscover it.
+
+### `ping` — trace/ping a node
+
+Calls Home Assistant's structured MeshCore trace service directly with the prefix you provide. It does not resolve the prefix through `mc contacts`.
+
+```bash
+mc ping <pubkey_prefix>
+mc ping <pubkey_prefix> 30
+```
+
 ### `chan` — send a channel message
 
 ```bash
@@ -85,9 +111,17 @@ mc chan 0 "broadcast to channel 0"
 mc chan 1 "team channel message"
 ```
 
-### `contacts` — list all MeshCore entities
+### `sensors` — list all MeshCore entities
 
 Shows every `sensor.meshcore_*` entity with its current value and unit.
+
+```bash
+mc sensors
+```
+
+### `contacts` — list MeshCore contacts
+
+Lists meshcore-ha contact entities from Home Assistant, including discovered contacts stored by the integration and contacts added to the node.
 
 ```bash
 mc contacts
@@ -170,7 +204,7 @@ wait
 ### Dump all contacts with their key prefix
 
 ```bash
-mc cmd "get_contacts(0)" | jq '.[] | {name: .adv_name, key: .pubkey_prefix}'
+mc contacts
 ```
 
 ### Set TX power
