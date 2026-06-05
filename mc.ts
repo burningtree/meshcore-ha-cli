@@ -358,21 +358,298 @@ async function routeContact(pubkeyPrefix: string, rawPath?: string) {
   }, null, 2));
 }
 
-function formatTracePath(value: unknown) {
-  if (Array.isArray(value)) return value.map(String).join(",");
-  if (typeof value === "string") return value;
+function formatTracePath(value: unknown): string {
   if (value === undefined || value === null) return "";
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) {
+    return value.map((hop: any) => {
+      if (typeof hop === "object" && hop !== null) {
+        const hash = hop.hash ?? hop.pubkey_prefix ?? "";
+        const snr = hop.snr !== undefined ? ` snr=${hop.snr}dB` : "";
+        return `${hash}${snr}`;
+      }
+      return String(hop);
+    }).join(" → ");
+  }
   return JSON.stringify(value);
 }
 
-async function pingContact(pubkeyPrefix: string, timeoutSeconds = 15) {
+// Parse a raw path hex string into comma-separated 2-byte hop hashes.
+// meshcore-ha encodes paths as contiguous hex with 2-byte (4 hex char) hops.
+function parseRawPath(hex: string): string[] {
+  if (!hex || hex.length % 4 !== 0) return [];
+  const hops: string[] = [];
+  for (let i = 0; i < hex.length; i += 4) hops.push(hex.slice(i, i + 4));
+  return hops;
+}
+
+// Read the stored route for a contact from its HA binary_sensor attributes,
+// which carry out_path / out_path_len. Returns a saveable comma-route or null.
+async function readStoredRoute(prefix: string): Promise<{ route: string | null; len: number | null; raw: string }> {
+  const states: any[] = await haGet("/api/states").catch(() => []);
+  const contact = states.find((e) =>
+    e.entity_id.startsWith("binary_sensor.meshcore_") &&
+    ((e.attributes?.pubkey_prefix ?? e.attributes?.public_key ?? "").toLowerCase().startsWith(prefix))
+  );
+  if (!contact) return { route: null, len: null, raw: "" };
+  const a = contact.attributes ?? {};
+  const len: number | null = a.out_path_len ?? null;
+  const raw: string = a.out_path ?? "";
+  let route: string | null = null;
+  if (len === 0) route = "direct";
+  else if (len !== null && len > 0 && raw) route = parseRawPath(raw).join(",");
+  // len === -1 means flood (no discovered path) -> route stays null
+  return { route, len, raw };
+}
+
+// Subscribe to meshcore_raw_event over WS; calls onEvent(type, payload) per event.
+// Returns a close() function.
+function subscribeRawEvents(onEvent: (evType: string, payload: any) => void): () => void {
+  const ws = new WebSocket(wsUrl(), VERIFY ? undefined : { tls: { rejectUnauthorized: false } } as any);
+  let msgId = 1;
+  ws.onmessage = (ev) => {
+    const msg = parseWsData(ev.data);
+    if (msg.type === "auth_required") {
+      ws.send(JSON.stringify({ type: "auth", access_token: HA_TOKEN }));
+    } else if (msg.type === "auth_ok") {
+      ws.send(JSON.stringify({ id: msgId++, type: "subscribe_events", event_type: "meshcore_raw_event" }));
+    } else if (msg.type === "event") {
+      const d = msg.event?.data ?? {};
+      onEvent(d.event_type ?? "", d.payload ?? {});
+    }
+  };
+  ws.onerror = () => {};
+  return () => { try { ws.close(); } catch {} };
+}
+
+// Discover a route by sending a real PATH_REQUEST (send_path_discovery, the
+// \x34 flood request). The destination floods back a PATH response and the SDK
+// adopts the route into the contact, so out_path_len flips from -1 (flood) to
+// >=0. We poll that as the authoritative success signal.
+async function findPath(pubkeyPrefix: string, timeoutSeconds = 30, retryInterval: number | null = null, hashSize = 1) {
+  const prefix = (await expandPubkeyPrefix(pubkeyPrefix.toLowerCase(), 6)).toLowerCase();
+  const t0 = Date.now();
+
+  const before = await readStoredRoute(prefix);
+  if (before.len !== null && before.len >= 0) {
+    console.error(`  contact already has a stored path (no discovery needed)`);
+    console.log(JSON.stringify({
+      pubkey_prefix: prefix, ok: true, already_known: true,
+      hop_count: before.len, route: before.route, raw_path: before.raw,
+    }, null, 2));
+    if (before.route && before.route !== "direct")
+      console.error(`\n  trace it: mc trace "${before.route}"`);
+    return;
+  }
+  console.error(`  current route: flood (no path) — starting discovery`);
+
+  // The path-discovery answer arrives as an RX_LOG_DATA packet whose
+  // payload_typename is RESPONSE (or PATH), carrying parsed.path_nodes — the
+  // hop hashes of the route. We watch every received packet and capture the
+  // first RESPONSE/PATH whose route includes our target's hash.
+  const targetHash = prefix.slice(0, 4);
+  let captured: { ptype: string; pathNodes: string[]; pathHex: string; snr: any; rssi: any } | null = null;
+  const closeWs = subscribeRawEvents((_evType, payload) => {
+    const ptype = String(payload.payload_typename ?? "");
+    if (!/RESPONSE|PATH/i.test(ptype)) return;  // only path-bearing packets
+    const pathNodes: string[] = (payload.parsed?.path_nodes ?? []).map((h: string) => h.toLowerCase());
+    const pathHex = String(payload.parsed?.path ?? payload.path ?? "").toLowerCase();
+    const hitsTarget = pathNodes.some((h) => h.startsWith(targetHash)) || pathHex.includes(targetHash);
+    console.error(`  « ${ptype} path=${pathNodes.join("→") || pathHex || "?"} snr=${payload.snr ?? "?"} rssi=${payload.rssi ?? "?"}${hitsTarget ? "  ← target!" : ""}`);
+    if (hitsTarget && !captured) {
+      captured = { ptype, pathNodes, pathHex, snr: payload.snr, rssi: payload.rssi };
+    }
+  });
+
+  try {
+    let attempt = 0;
+    while (true) {
+      attempt++;
+      console.error(`→ sending PATH_REQUEST to ${prefix}  (attempt ${attempt})…`);
+
+      try {
+        // Space-separated form (NOT functional parens): a hex prefix like
+        // "51535efda66a" is not a valid Python literal, so meshcore-ha's
+        // ast-based functional parser rejects it and the command is dropped.
+        // The shlex path resolves the prefix to a contact correctly.
+        const resp = await haPost("/api/services/meshcore/execute_command?return_response=true", {
+          command: `send_path_discovery ${prefix} ${hashSize}`,
+        }).then((b) => b?.service_response ?? b).catch((e) => ({ error: e.message }));
+        console.error(`  PATH_REQUEST sent → ${JSON.stringify(resp)}`);
+      } catch (e: any) {
+        console.error(`  send error: ${e.message}`);
+      }
+
+      // Race two success signals: (a) a captured PATH event, (b) the contact's
+      // out_path populating (authoritative once the SDK adopts the route).
+      const deadline = Date.now() + timeoutSeconds * 1000;
+      let found: Awaited<ReturnType<typeof readStoredRoute>> | null = null;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 1500));
+        if (captured) break;
+        const now = await readStoredRoute(prefix);
+        if (now.len !== null && now.len >= 0) { found = now; break; }
+        process.stderr.write(".");
+      }
+      process.stderr.write("\n");
+
+      if (found) {
+        console.log(JSON.stringify({
+          pubkey_prefix: prefix, ok: true, attempt, elapsed_ms: Date.now() - t0,
+          source: "out_path", hop_count: found.len, route: found.route, raw_path: found.raw,
+        }, null, 2));
+        if (found.route === "direct") console.error(`\n✓ Direct path discovered (no repeater hops).`);
+        else console.error(`\n✓ Path discovered: ${found.route}\n  trace it: mc trace "${found.route}"`);
+        return;
+      }
+
+      if (captured) {
+        const c = captured as NonNullable<typeof captured>;
+        const route = (c.pathNodes.length ? c.pathNodes : parseRawPath(c.pathHex)).join(",");
+        console.log(JSON.stringify({
+          pubkey_prefix: prefix, ok: true, attempt, elapsed_ms: Date.now() - t0,
+          source: `RX_LOG_DATA/${c.ptype}`,
+          path_nodes: c.pathNodes, raw_path: c.pathHex, route,
+          snr: c.snr, rssi: c.rssi,
+        }, null, 2));
+        console.error(`\n✓ Discovered route to ${prefix} via ${c.ptype}: ${route}`);
+        console.error(`  trace it: mc trace "${route}"`);
+        return;
+      }
+
+      console.error(`  ✗ no PATH response within ${timeoutSeconds}s`);
+
+      if (retryInterval === null) {
+        console.log(JSON.stringify({
+          pubkey_prefix: prefix, ok: false, attempt,
+          elapsed_ms: Date.now() - t0, error: "no_path_response",
+        }, null, 2));
+        console.error(`\nTip: discovery is intermittent — keep retrying: mc find ${pubkeyPrefix} -r`);
+        return;
+      }
+      console.error(`  retrying in ${retryInterval}s…  (Ctrl+C to stop)`);
+      await new Promise((r) => setTimeout(r, retryInterval * 1000));
+    }
+  } finally {
+    closeWs();
+  }
+}
+
+async function traceRoute(route: string, timeoutSeconds = 15): Promise<boolean> {
+  console.error(`→ trace_route  route=${route}`);
+  const t0 = Date.now();
+  const payload = await meshcoreService("trace_route", {
+    route,
+    timeout: timeoutSeconds,
+  });
+  const elapsed = Date.now() - t0;
+  const trace = payload?.trace;
+
+  if (!trace) {
+    console.log(JSON.stringify({
+      ok: false,
+      elapsed_ms: elapsed,
+      error: payload?.error ?? "trace_failed",
+      route,
+    }, null, 2));
+    return false;
+  }
+
+  console.log(JSON.stringify({
+    ok: true,
+    elapsed_ms: elapsed,
+    hop_count: trace.hop_count ?? trace.hops,
+    path: formatTracePath(trace.path ?? trace.route ?? trace.hops_path),
+    rtt_ms: trace.rtt_ms ?? trace.round_trip_ms ?? trace.elapsed_ms,
+    snr: trace.snr ?? trace.snr_values ?? trace.per_hop_snr,
+    route,
+    trace,
+  }, null, 2));
+  return true;
+}
+
+async function pingContact(pubkeyPrefix: string, timeoutSeconds = 15): Promise<boolean> {
   if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0) {
     throw new Error("timeout must be a positive number of seconds");
   }
 
+  // Resolve the contact's stored out_path from HA entity states.
+  // trace_route needs an explicit firmware path — it does no contact lookup.
+  const states: any[] = await haGet("/api/states");
+  const prefix = pubkeyPrefix.toLowerCase();
+
+  // Find the out_path and out_path_len sensor entities for this pubkey.
+  // The entity_id segment is the full pubkey (10 chars), so match by prefix.
+  const matchesPrefix = (id: string) =>
+    id.replace("sensor.meshcore_", "").startsWith(prefix);
+
+  const outPathEntity = states.find(e =>
+    e.entity_id.includes("_out_path_") &&
+    !e.entity_id.includes("_out_path_len_") &&
+    matchesPrefix(e.entity_id)
+  );
+  const outPathLenEntity = states.find(e =>
+    e.entity_id.includes("_out_path_len_") &&
+    matchesPrefix(e.entity_id)
+  );
+
+  const outPath = outPathEntity?.state ?? "";
+  const outPathLen = outPathLenEntity ? parseInt(outPathLenEntity.state) : -2;
+
+  if (outPathLen === -2) {
+    throw new Error(`No out_path entities found for pubkey prefix "${pubkeyPrefix}". Is this a repeater contact saved on the device?`);
+  }
+
+  if (outPathLen === -1) {
+    // Flood contact — no explicit path stored, fall back to trace service
+    console.error("Contact has no stored path (flood) — falling back to trace service");
+    const t0 = Date.now();
+    const payload = await meshcoreService("trace", {
+      pubkey_prefix: pubkeyPrefix,
+      timeout: timeoutSeconds,
+    });
+    const elapsed = Date.now() - t0;
+    const trace = payload?.trace;
+    if (!trace) {
+      console.log(JSON.stringify({ pubkey_prefix: pubkeyPrefix, ok: false, elapsed_ms: elapsed, error: payload?.error ?? "trace_failed" }, null, 2));
+      return false;
+    }
+    console.log(JSON.stringify({ pubkey_prefix: pubkeyPrefix, ok: true, elapsed_ms: elapsed, trace }, null, 2));
+    return true;
+  }
+
+  // out_path_len=0 means direct (no intermediate hops) — trace_route needs
+  // a non-empty path so fall back to trace (which handles direct contacts).
+  if (outPathLen === 0 || !outPath) {
+    console.error(`→ trace (direct contact, no stored path) pubkey=${pubkeyPrefix}`);
+    const t0 = Date.now();
+    const payload = await meshcoreService("trace", {
+      pubkey_prefix: pubkeyPrefix,
+      timeout: timeoutSeconds,
+    });
+    const elapsed = Date.now() - t0;
+    const trace = payload?.trace;
+    if (!trace) {
+      console.log(JSON.stringify({ pubkey_prefix: pubkeyPrefix, ok: false, elapsed_ms: elapsed, error: payload?.error ?? "trace_failed" }, null, 2));
+      return false;
+    }
+    console.log(JSON.stringify({
+      pubkey_prefix: pubkeyPrefix, ok: true, elapsed_ms: elapsed,
+      hop_count: trace.hop_count ?? trace.hops,
+      path: formatTracePath(trace.path ?? trace.route ?? trace.hops_path),
+      rtt_ms: trace.rtt_ms ?? trace.round_trip_ms ?? trace.elapsed_ms,
+      snr: trace.snr ?? trace.snr_values,
+      route: "direct",
+      trace,
+    }, null, 2));
+    return true;
+  }
+
+  console.error(`→ trace_route  path=${outPath}  len=${outPathLen}`);
+
   const t0 = Date.now();
-  const payload = await meshcoreService("trace", {
-    pubkey_prefix: pubkeyPrefix,
+  const payload = await meshcoreService("trace_route", {
+    route: outPath,
     timeout: timeoutSeconds,
   });
   const elapsed = Date.now() - t0;
@@ -384,9 +661,9 @@ async function pingContact(pubkeyPrefix: string, timeoutSeconds = 15) {
       ok: false,
       elapsed_ms: elapsed,
       error: payload?.error ?? "trace_failed",
-      response: payload,
+      route: outPath,
     }, null, 2));
-    return;
+    return false;
   }
 
   console.log(JSON.stringify({
@@ -397,8 +674,10 @@ async function pingContact(pubkeyPrefix: string, timeoutSeconds = 15) {
     path: formatTracePath(trace.path ?? trace.route ?? trace.hops_path),
     rtt_ms: trace.rtt_ms ?? trace.round_trip_ms ?? trace.elapsed_ms,
     snr: trace.snr ?? trace.snr_values ?? trace.per_hop_snr,
+    route: outPath,
     trace,
   }, null, 2));
+  return true;
 }
 
 function wsUrl() {
@@ -439,6 +718,29 @@ function mergeContacts(contacts: any[]) {
 function findContactByPrefix(contacts: any[], pubkeyPrefix: string) {
   const prefix = pubkeyPrefix.toLowerCase();
   return contacts.filter((contact) => contactKey(contact).toLowerCase().startsWith(prefix));
+}
+
+// Expand a short pubkey prefix to at least minLen chars using HA binary sensor
+// attributes, which carry the full public_key. Falls back to the input unchanged.
+async function expandPubkeyPrefix(prefix: string, minLen = 6): Promise<string> {
+  if (prefix.length >= minLen) return prefix;
+  try {
+    const states: any[] = await haGet("/api/states");
+    const match = states.find(e => {
+      if (!e.entity_id.startsWith("binary_sensor.meshcore_")) return false;
+      const attrs = e.attributes ?? {};
+      const pk: string = (attrs.pubkey_prefix ?? attrs.public_key ?? "").toLowerCase();
+      return pk.startsWith(prefix.toLowerCase());
+    });
+    if (match) {
+      const full: string = (match.attributes?.pubkey_prefix ?? match.attributes?.public_key ?? "").toLowerCase();
+      if (full.length >= minLen) {
+        console.error(`  expanded ${prefix} → ${full.slice(0, Math.max(minLen, 12))} (${match.attributes?.adv_name ?? "?"})`);
+        return full.slice(0, Math.max(minLen, 12));
+      }
+    }
+  } catch {}
+  return prefix;
 }
 
 function messageText(data: any) {
@@ -828,31 +1130,14 @@ async function getState(entityId: string) {
 }
 
 // All event types fired by meshcore-ha
-const MESHCORE_EVENTS = [
-  "meshcore_message",           // incoming message / channel message
-  "meshcore_message_sent",      // outgoing message confirmation
-  "meshcore_delivery_update",   // delivery ACK
-  "meshcore_connected",         // radio connected
-  "meshcore_disconnected",      // radio disconnected
-  "meshcore_raw_event",         // raw firmware events
-];
-
 async function streamEvents(seconds: number | null, filter?: string) {
-  const wsUrl = HA_URL.replace(/^https/, "wss").replace(/^http/, "ws") + "/api/websocket";
-  console.error(`Connecting to ${wsUrl}${seconds ? ` for ${seconds}s` : ""}… (Ctrl+C to stop)`);
+  const url = HA_URL.replace(/^https/, "wss").replace(/^http/, "ws") + "/api/websocket";
+  console.error(`Connecting to ${url}${seconds ? ` for ${seconds}s` : ""}… (Ctrl+C to stop)`);
 
-  const events = filter
-    ? MESHCORE_EVENTS.filter(e => e.includes(filter))
-    : MESHCORE_EVENTS;
-
-  // Bun's WebSocket supports tls options via the second argument
-  const ws = new WebSocket(wsUrl, VERIFY ? undefined : { tls: { rejectUnauthorized: false } } as any);
+  const flt = filter?.toLowerCase();
+  const ws = new WebSocket(url, VERIFY ? undefined : { tls: { rejectUnauthorized: false } } as any);
   let msgId = 1;
   let ready = false;
-
-  ws.onopen = () => {
-    // auth_required fires after open; nothing to send yet
-  };
 
   ws.onmessage = (ev) => {
     const msg = JSON.parse(typeof ev.data === "string" ? ev.data : ev.data.toString());
@@ -862,10 +1147,11 @@ async function streamEvents(seconds: number | null, filter?: string) {
 
     } else if (msg.type === "auth_ok") {
       ready = true;
-      console.error(`✓ authenticated — subscribing to ${events.length} event types\n`);
-      for (const event_type of events) {
-        ws.send(JSON.stringify({ id: msgId++, type: "subscribe_events", event_type }));
-      }
+      console.error(`✓ authenticated — subscribing to ALL events (showing meshcore_*)\n`);
+      // Subscribe with no event_type → every event on the HA bus. We filter to
+      // meshcore_* client-side, so any meshcore event type is caught, even ones
+      // we don't know about (HA has no wildcard event_type subscription).
+      ws.send(JSON.stringify({ id: msgId++, type: "subscribe_events" }));
 
     } else if (msg.type === "auth_invalid") {
       console.error("✗ authentication failed — check HA_TOKEN");
@@ -873,9 +1159,16 @@ async function streamEvents(seconds: number | null, filter?: string) {
 
     } else if (msg.type === "event" && msg.event?.event_type) {
       const { event_type, data, time_fired } = msg.event;
+      // Skip the HA firehose (state_changed, call_service, …) — meshcore only.
+      if (!String(event_type).startsWith("meshcore")) return;
+      // For meshcore_raw_event the SDK event type is nested in data.event_type.
+      const sdkType = data?.event_type;
+      // Optional substring filter matches either the HA type or the SDK type.
+      if (flt && !`${event_type} ${sdkType ?? ""}`.toLowerCase().includes(flt)) return;
       const ts = time_fired ? new Date(time_fired).toISOString() : new Date().toISOString();
-      // Print as clean JSON line — works with: mc events | jq .
-      process.stdout.write(JSON.stringify({ ts, type: event_type, data }) + "\n");
+      process.stdout.write(JSON.stringify({
+        ts, type: event_type, ...(sdkType ? { sdk_type: sdkType } : {}), data,
+      }) + "\n");
 
     } else if (msg.type === "result" && !msg.success) {
       console.error(`subscription error: ${JSON.stringify(msg.error)}`);
@@ -886,10 +1179,7 @@ async function streamEvents(seconds: number | null, filter?: string) {
   ws.onclose = () => { if (ready) console.error("\nConnection closed."); };
 
   await new Promise<void>((resolve) => {
-    if (seconds !== null) {
-      setTimeout(() => { ws.close(); resolve(); }, seconds * 1000);
-    }
-    // Otherwise run until Ctrl+C / process exit
+    if (seconds !== null) setTimeout(() => { ws.close(); resolve(); }, seconds * 1000);
     process.on("SIGINT", () => { ws.close(); resolve(); });
     process.on("SIGTERM", () => { ws.close(); resolve(); });
   });
@@ -898,6 +1188,20 @@ async function streamEvents(seconds: number | null, filter?: string) {
 // ---------------------------------------------------------------------------
 // CLI entry point
 // ---------------------------------------------------------------------------
+
+// Run an action that returns ok=true/false. With retryInterval set, keep
+// retrying on failure until it succeeds (Ctrl+C to stop).
+async function runWithRetry(fn: () => Promise<boolean>, retryInterval: number | null) {
+  let attempt = 0;
+  while (true) {
+    attempt++;
+    if (retryInterval !== null && attempt > 1) console.error(`\n--- attempt ${attempt} ---`);
+    const ok = await fn();
+    if (ok || retryInterval === null) return;
+    console.error(`  failed — retrying in ${retryInterval}s…  (Ctrl+C to stop)`);
+    await new Promise((r) => setTimeout(r, retryInterval * 1000));
+  }
+}
 
 function printHelp() {
   console.log(`
@@ -908,7 +1212,9 @@ Commands:
   send <pubkey> <msg>        Send a direct message to a contact by pubkey prefix
   chat <pubkey>              Start interactive chat with a contact by pubkey prefix
   route <pubkey> [path]      Show or set contact route (direct, auto/reset/flood, or hex)
+  find <pubkey> [secs] [-r] [--hash-size N]  Discover a path to a flood contact (-r retries; --hash-size default 1)
   ping <pubkey> [seconds]    Trace/ping a pubkey prefix without contact lookup
+  trace <route> [secs] [-r]  Trace an explicit multi-hop route, e.g. "0a53,5153,0a53"
   chan <idx> <msg>           Send a channel message
   contacts                   List MeshCore contacts available in HA
   sensors                    List all meshcore sensor entities
@@ -921,7 +1227,9 @@ Commands:
 const { values, positionals } = parseArgs({
   args: Bun.argv.slice(2),
   options: {
-    help: { type: "boolean", short: "h" },
+    help:      { type: "boolean", short: "h" },
+    retry:     { type: "string",  short: "r" },
+    "hash-size": { type: "string",  short: "s" },
   },
   strict: true,
   allowPositionals: true,
@@ -962,9 +1270,30 @@ try {
 
     case "ping": {
       requireHaConfig();
-      if (!rest[0]) throw new Error("Usage: mc ping <pubkey_prefix> [timeout_seconds]");
+      if (!rest[0]) throw new Error("Usage: mc ping <pubkey_prefix> [timeout_seconds] [-r [interval]]");
       const timeoutSeconds = rest[1] === undefined ? 15 : Number(rest[1]);
-      await pingContact(rest[0], timeoutSeconds);
+      const retryInterval = values.retry !== undefined ? Number(values.retry ?? 5) : null;
+      await runWithRetry(() => pingContact(rest[0], timeoutSeconds), retryInterval);
+      break;
+    }
+
+    case "find": {
+      requireHaConfig();
+      if (!rest[0]) throw new Error("Usage: mc find <pubkey_prefix> [timeout_seconds] [-r [interval]] [-s hash_size]\n  -r / --retry      keep retrying until the node responds (path discovery is intermittent)\n  -s / --hash-size  hash size for path discovery (default: 1)");
+      const timeout = rest[1] === undefined ? 60 : Number(rest[1]);
+      const retryInterval = values.retry !== undefined ? Number(values.retry ?? 5) : null;
+      const hashSize = values["hash-size"] !== undefined ? Number(values["hash-size"]) : 1;
+      await findPath(rest[0], timeout, retryInterval, hashSize);
+      break;
+    }
+
+    case "trace": {
+      requireHaConfig();
+      if (!rest[0]) throw new Error("Usage: mc trace <route> [timeout_seconds] [-r interval_seconds]\n  route: comma-separated hop hashes, e.g. 0a53,5153,0a53");
+      const route = rest[0];
+      const timeoutSeconds = rest[1] === undefined ? 15 : Number(rest[1]);
+      const retryInterval = values.retry !== undefined ? Number(values.retry ?? 5) : null;
+      await runWithRetry(() => traceRoute(route, timeoutSeconds), retryInterval);
       break;
     }
 
